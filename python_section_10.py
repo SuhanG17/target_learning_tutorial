@@ -18,6 +18,7 @@ from python_section_3 import evaluate_psi, compute_eic
 from python_section_6 import compute_psi_hat_ab, compute_bias_ab, compute_clt, plot_bias_ab
 from python_section_7 import estimate_Gbar, estimate_QW, estimate_Qbar
 from python_section_8 import compute_gcomp, get_learned_features, update_learned_features, get_psi_hat_de
+from python_section_9 import apply_one_step_correction
 from python_algorithms import WorkingModelBase, WorkingModelGOne, WorkingModelGTwo, WorkingModelGThree, WorkingModelQOne, KknnAlgo, BoostingTreeAlgo, BoostingLMAlgo
 
 # Helper fn: choose the correct Qbar estimation format 
@@ -458,9 +459,225 @@ def get_risk_per_h0_h1(obs_df, Qbar_hat, Qbar_algorithm, Qbar_use_predict, lGAW,
     return risk, filtered_risk_df, idx_min, idx_zero, labels
 
 
-
-
+# 10.4.1 A first numerical application
+# Preliminary calculations
+def preliminary(obs, Qbar_hat, Gbar_hat, 
+                Qbar_algorithm=None,
+                Qbar_use_predict=False,
+                Gbar_use_predict=False,
+                threshold=5e-2):
+    if not all(col in obs.columns for col in ["W", "A", "Y"]):
+        raise ValueError("Argument 'dat' must contain columns 'W', 'A', and 'Y'.")
     
+    QAW = choose_Qbar_format(obs[["A", "W"]], Qbar_hat, 
+                             algorithm=Qbar_algorithm, use_predict=Qbar_use_predict)
+    QoneW = choose_Qbar_format(pd.DataFrame({"A": 1, "W": obs["W"]}), Qbar_hat, 
+                               algorithm=Qbar_algorithm, use_predict=Qbar_use_predict)
+    QzeroW = choose_Qbar_format(pd.DataFrame({"A": 0, "W": obs["W"]}), Qbar_hat,
+                                 algorithm=Qbar_algorithm, use_predict=Qbar_use_predict)
+    Gbar_out = choose_Gbar_format(obs["W"].values, Gbar_hat, use_predict=Gbar_use_predict)
+    GW = np.clip(Gbar_out, threshold, 1 - threshold)
+    HW = obs["A"] / GW - (1 - obs["A"]) / (1 - GW)
+    
+    return pd.DataFrame({"QAW": QAW, "QoneW": QoneW, "QzeroW": QzeroW, "GW": GW, "HW": HW})
+
+def apply_targeting_step(dat, Qbar_hat, Gbar_hat, 
+                         Qbar_algorithm=None,
+                         Qbar_use_predict=False,
+                         Gbar_use_predict=False,
+                         threshold=5e-2, epsilon=None):
+    """
+    Apply the targeting step to adjust Qbar using the targeting parameter epsilon.
+
+    Args:
+        dat (pd.DataFrame): DataFrame containing columns 'W', 'A', and 'Y'.
+        Gbar (callable): Function to estimate G(W).
+        Qbar (callable): Function to estimate Q(A, W).
+        threshold (float): Threshold value for probabilities (default is 0.05).
+        epsilon (float, optional): Targeting parameter. If None, it is estimated.
+
+    Returns:
+        pd.DataFrame: DataFrame containing psi_n, sig_n, and crit_n.
+    """
+    # Validate threshold
+    if not (1e-3 <= threshold <= 1 - 1e-3):
+        raise ValueError("Threshold must be between 0.001 and 0.999.")
+
+    tib = preliminary(dat, Qbar_hat, Gbar_hat, 
+                      Qbar_algorithm=Qbar_algorithm, Qbar_use_predict=Qbar_use_predict, 
+                      Gbar_use_predict=Gbar_use_predict, threshold=threshold)
+
+    # Estimate epsilon if not provided
+    if epsilon is None:
+        glm_model = smf.glm(formula="Y ~ HW - 1", data=pd.DataFrame({"Y":dat["Y"], "HW":tib["HW"]}),
+                            family=sm.families.Binomial(),
+                            offset=logit(tib["QAW"])
+                        )
+        fit = glm_model.fit()
+        epsilon = fit.params[0]
+
+    # Update Qbar with epsilon
+    QoneW_epsilon = expit(logit(tib["QoneW"]) + epsilon / tib["GW"])
+    QzeroW_epsilon = expit(logit(tib["QzeroW"]) - epsilon / (1 - tib["GW"]))
+    QAW_epsilon = dat["A"] * QoneW_epsilon + (1 - dat["A"]) * QzeroW_epsilon
+
+    # Compute psi_n, sig_n, and crit_n
+    psi_n = np.mean(QoneW_epsilon - QzeroW_epsilon)
+    eic_dat = (dat["Y"] - QAW_epsilon) * tib["HW"] + QoneW_epsilon - QzeroW_epsilon - psi_n
+    sig_n = np.std(eic_dat) / np.sqrt(len(dat))
+    crit_n = np.mean(eic_dat)
+
+    return pd.DataFrame({"psi_n": [psi_n], "sig_n": [sig_n], "crit_n": [crit_n]})
+
+# Practice Problem 10.4.2.2
+def get_psi_and_crit_by_epsilon(dat, Qbar_hat, Gbar_hat, 
+                                Qbar_algorithm=None,
+                                Qbar_use_predict=False,
+                                Gbar_use_predict=False,
+                                threshold=5e-2, epsilon=None):
+    psi_n = []
+    crit_n = []
+    for h in epsilon:
+        result = apply_targeting_step(dat, Qbar_hat, Gbar_hat, 
+                                      Qbar_algorithm=Qbar_algorithm,
+                                      Qbar_use_predict=Qbar_use_predict,
+                                      Gbar_use_predict=Gbar_use_predict,
+                                      threshold=threshold, epsilon=h)
+        psi_n.append(result["psi_n"].values[0])
+        crit_n.append(result["crit_n"].values[0])
+    psi_Qbar_epsilon = pd.DataFrame({"psi_n": psi_n, "crit_n": crit_n})
+    idx_Qbar = np.argmin(np.abs(psi_Qbar_epsilon["crit_n"]))
+
+    return psi_Qbar_epsilon, idx_Qbar 
+    
+
+
+def prepare_psi_crit_data(dat, Qbar_hat_dict, Gbar_hat_dict, 
+                            Qbar_algorithm_dict=None,
+                            Qbar_use_predict_dict=False,
+                            Gbar_use_predict_dict=False,
+                            threshold_dict=5e-2):
+    # Define epsilon range
+    epsilon = np.linspace(-1e-2, 1e-2, int(1e2))
+
+    # Compute psi_trees_epsilon
+    psi_trees_epsilon, idx_trees = get_psi_and_crit_by_epsilon(dat, 
+                                                              Qbar_hat_dict["trees"], 
+                                                              Gbar_hat_dict["trees"],
+                                                              Qbar_algorithm=Qbar_algorithm_dict["trees"],
+                                                              Qbar_use_predict=Qbar_use_predict_dict["trees"],
+                                                              Gbar_use_predict=Gbar_use_predict_dict["trees"],
+                                                              threshold=threshold_dict["trees"],
+                                                              epsilon=epsilon)
+
+    # Compute psi_kknn_epsilon
+    psi_kknn_epsilon, idx_kknn = get_psi_and_crit_by_epsilon(dat,
+                                                            Qbar_hat_dict["kknn"], 
+                                                            Gbar_hat_dict["kknn"],
+                                                            Qbar_algorithm=Qbar_algorithm_dict["kknn"],
+                                                            Qbar_use_predict=Qbar_use_predict_dict["kknn"],
+                                                            Gbar_use_predict=Gbar_use_predict_dict["kknn"],
+                                                            threshold=threshold_dict["kknn"],
+                                                            epsilon=epsilon)
+
+
+    # Combine results into a single DataFrame
+    results_df = pd.concat([psi_trees_epsilon, psi_kknn_epsilon], axis=0).reset_index(drop=True)
+    
+    # Add a 'type' column to indicate the source of each row
+    results_df["type"] = np.repeat(["trees", "kknn"], len(epsilon))
+    
+    return results_df, idx_trees, idx_kknn, psi_trees_epsilon, psi_kknn_epsilon
+
+
+def plot_psi_crit_data(results_df, idx_trees, idx_kknn, psi_trees_epsilon, psi_kknn_epsilon):
+    # Plot using seaborn
+    plt.figure(figsize=(12, 8))
+    sns.scatterplot(data=results_df, x="crit_n", y="psi_n", hue="type", palette="Set1")
+
+    # Add vertical and horizontal lines
+    plt.axvline(x=0, color="black", linestyle="--", label="crit_n = 0")
+    plt.axhline(y=psi_trees_epsilon["psi_n"][idx_trees], color="blue", linestyle="--", label="psi_trees_at_crit_min")
+    plt.axhline(y=psi_kknn_epsilon["psi_n"][idx_kknn], color="green", linestyle="--", label="psi_kknn_at_crit_min")
+
+    # Customize labels
+    plt.xlabel(r"$P_n D^*(P_{n,h}^o)$")
+    plt.ylabel(r"$\Psi(P_{n,h}^o)$")
+    plt.legend(title="Type")
+    plt.title("Empirical Investigation of Targeting Step")
+
+    # Show the plot
+    plt.tight_layout()
+    plt.show()
+
+# 10.4.3 Empirical investigation
+def update_learned_features(learned_features, algorithm_d=None, algorithm_e=None,
+                            Gbar_algorithm=None):
+    # Assuming learned_features_fixed_sample_size is a pandas DataFrame
+    for key, entry in learned_features.items():
+        entry["Qbar_hat_d"] = estimate_Qbar(entry["obs"], algorithm=algorithm_d)
+        entry["Qbar_hat_e"] = estimate_Qbar(entry["obs"], algorithm=algorithm_e)
+        Gbar_hat = estimate_Gbar(entry["obs"], algorithm=Gbar_algorithm)
+        entry["est_d"] = apply_targeting_step(entry["obs"], entry["Qbar_hat_d"], 
+                                                Gbar_hat=Gbar_hat,
+                                                Qbar_algorithm=algorithm_d,
+                                                Qbar_use_predict=True,
+                                                Gbar_use_predict=True,
+                                                threshold=0.05, epsilon=None)
+        entry["est_e"] = apply_targeting_step(entry["obs"], entry["Qbar_hat_e"],
+                                                Gbar_hat=Gbar_hat,
+                                                Qbar_algorithm=algorithm_e,
+                                                Qbar_use_predict=True,
+                                                Gbar_use_predict=True,
+                                                threshold=0.05, epsilon=None)
+    return learned_features
+
+def plot_estimation_bias_de(psi_hat_de_df, bias_de):    
+    # Generate the standard normal distribution
+    x = np.linspace(-4, 4, 1000)
+    y = norm.pdf(x)
+    
+    # Create the plot
+    fig, ax = plt.subplots(nrows=1, ncols=2, figsize=(10, 6))
+
+    for id_norm, ((if_norm_, norm_group), (if_norm_bias, norm_bias)) in enumerate(zip(psi_hat_de_df.groupby("auto_renormalization"), 
+                                                        bias_de.groupby("auto_renormalization"))): 
+
+        # Plot the standard normal distribution
+        sns.lineplot(x=x, y=y, ax=ax[id_norm], linestyle='-', color="grey", alpha=0.5, label="Standard Normal")
+        
+        # Plot density for clt
+        color_index = {}
+        for id_type, (type_, group) in enumerate(norm_group.groupby("type")): 
+            sns.kdeplot(group["clt"], 
+                        fill=True, 
+                        alpha=0.1, 
+                        label=f"{type_}_targeted", 
+                        ax=ax[id_norm])
+            color_index[type_] = id_type
+            
+        
+        for _, row in norm_bias.iterrows():
+            color_id = color_index[row["type"]]
+            ax[id_norm].axvline(x=row["bias"], 
+                                color=sns.color_palette()[color_id], 
+                                linestyle="--", 
+                                linewidth=1.5, 
+                                alpha=0.5, 
+                                label=f"Bias (Type {row['type']})")
+        
+        ax[id_norm].set_title("auto-renormalization:{}".format(if_norm_))
+        if not if_norm_:
+            ax[id_norm].set_xlim(-4, 4)
+            ax[id_norm].set_ylim(0, 0.5)
+            ax[id_norm].legend(title="Type", loc='upper left')
+        else:
+            ax[id_norm].set_xlim(-4, 4)
+            ax[id_norm].set_ylim(0, 0.5)
+            ax[id_norm].legend(title="Type", loc='upper right')
+        
+    fig.suptitle(r"$\sqrt{n/v_n^{d, e}} * (\psi_n^{d, e} - \psi_0)$", fontsize=12)
+    plt.show()
 
 
 
@@ -670,7 +887,57 @@ if __name__ == "__main__":
     Therefore, the alternative fluctuation and summed loss function form a valid TMLE submodel under the same principles as the original formulation.
     """
 
-    # TODO 10.4 Empirical investigation
+    # 10.4 Empirical investigation
+    # 10.4.1 A first numerical application
+    ## code adapted from  section 9
+    QW_hat = estimate_QW(obs_df[:int(1e3)])
+    kknn_algo = KknnAlgo()
+    Qbar_hat_kknn = estimate_Qbar(dat=obs_df[:int(1e3)], algorithm=kknn_algo)
+    psin_kknn = compute_gcomp(QW_hat, Qbar_hat_kknn, algorithm=kknn_algo, use_predict=True)
+    print(psin_kknn)
+    
+    working_model_G_one = WorkingModelGOne()
+    Gbar_hat = estimate_Gbar(dat=obs[:int(1e3)], algorithm=working_model_G_one)
+
+    psin_kknn_os = apply_one_step_correction(obs_df[:int(1e3)], Gbar_hat, Qbar_hat_kknn, psin_kknn["psi_n"][0],
+                                              Gbar_use_predict=True, Qbar_use_predict=True,
+                                              Gbar_algorithm=working_model_G_one, Qbar_algorithm=kknn_algo)
+    print(psin_kknn_os)
+
+    psin_kknn_tmle = apply_targeting_step(obs_df[:int(1e3)], Qbar_hat_kknn, Gbar_hat, 
+                                          Qbar_algorithm=kknn_algo, Qbar_use_predict=True,
+                                          Gbar_use_predict=True, threshold=5e-2, epsilon=None)
+    print(psin_kknn_tmle)
+
+    # 10.4.2 A computational exploration
+    # Practice Problem 10.4.2.1
+    """Epsilon it the optimal fluctuation parameter"""
+
+    # Practice Problem 10.4.2.2
+    results_df, idx_trees, idx_kknn, psi_trees_epsilon, psi_kknn_epsilon = prepare_psi_crit_data(obs_df[:int(1e3)], 
+                                                                                                 Qbar_hat_dict={"trees": Qbar_hat_trees, "kknn": Qbar_hat_kknn},
+                                                                                                 Gbar_hat_dict={"trees": Gbar_hat, "kknn": Gbar_hat},
+                                                                                                 Qbar_algorithm_dict={"trees": boosting_tree_algo, "kknn": kknn_algo},
+                                                                                                 Qbar_use_predict_dict={"trees": True, "kknn": True},
+                                                                                                 Gbar_use_predict_dict={"trees": True, "kknn": True},
+                                                                                                 threshold_dict={"trees": 5e-2, "kknn": 5e-2})
+    plot_psi_crit_data(results_df, idx_trees, idx_kknn, psi_trees_epsilon, psi_kknn_epsilon)
+
+    # Practice Problem 10.4.2.3
+    """The colored curves in Figure 10.3 look like line segments because the targeting step induces a one-dimensional fluctuation path in the model \bar{Q}_{n,h}, and both:
+	•	the parameter \Psi(P_{n,h}), and
+	•	the influence curve average P_n D^*(P_{n,h})
+    are (approximately) linear in h. This results in a linear trajectory in the 2D plot, forming straight segments for each method (trees, kknn)."""
+
+    # 10.4.3 Empirical investigation
+    iter = 1000
+    learned_features_fixed_sample_size = get_learned_features(obs_df, iter, working_model_G_one)
+    updated_features = update_learned_features(learned_features_fixed_sample_size, 
+                                               algorithm_d=kknn_algo, algorithm_e=boosting_tree_algo,
+                                               Gbar_algorithm=working_model_G_one)
+    psi_hat_de_df, bias_de = get_psi_hat_de(updated_features, psi_zero=evaluate_psi(experiment))
+    print(bias_de)
+    plot_estimation_bias_de(psi_hat_de_df, bias_de)
 
 
 
@@ -719,7 +986,7 @@ if __name__ == "__main__":
 
 #     return pred
 
-# def get_risk_per_h(candidates, lGAW, QAW, A, Y): # TODO
+# def get_risk_per_h(candidates, lGAW, QAW, A, Y):
 #     """
 #     Compute the risk for each candidate value given lGAW and QAW.
 

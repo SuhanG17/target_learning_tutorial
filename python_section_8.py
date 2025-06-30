@@ -296,15 +296,15 @@ def compute_gcomp(QW, Qbar_hat, algorithm=None, use_predict=False, n=int(1e3)):
 
 # 8.4.3 Empirical investigation, fixed sample size
 def update_learned_features(learned_features, algorithm_d=None, algorithm_e=None):
-        # Assuming learned_features_fixed_sample_size is a pandas DataFrame
-        for key, entry in learned_features.items():
-            entry["Qbar_hat_d"] = estimate_Qbar(entry["obs"], algorithm=algorithm_d)
-            entry["Qbar_hat_e"] = estimate_Qbar(entry["obs"], algorithm=algorithm_e)
-            QW = estimate_QW(entry["obs"])
-            entry["est_d"] = compute_gcomp(QW, entry["Qbar_hat_d"], algorithm=None, use_predict=True)
-            entry["est_e"] = compute_gcomp(QW, entry["Qbar_hat_e"], algorithm=algorithm_e, use_predict=True)
+    # Assuming learned_features_fixed_sample_size is a pandas DataFrame
+    for key, entry in learned_features.items():
+        entry["Qbar_hat_d"] = estimate_Qbar(entry["obs"], algorithm=algorithm_d)
+        entry["Qbar_hat_e"] = estimate_Qbar(entry["obs"], algorithm=algorithm_e)
+        QW = estimate_QW(entry["obs"])
+        entry["est_d"] = compute_gcomp(QW, entry["Qbar_hat_d"], algorithm=None, use_predict=True)
+        entry["est_e"] = compute_gcomp(QW, entry["Qbar_hat_e"], algorithm=algorithm_e, use_predict=True)
 
-        return learned_features
+    return learned_features
 
 def get_psi_hat_de(updated_features, psi_zero):
     # Assuming learned_features_fixed_sample_size is a pandas DataFrame
